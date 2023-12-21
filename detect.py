@@ -7,12 +7,17 @@ import cv2
 import os
 import glob
 import math
+from transformers import DPTFeatureExtractor, DPTForDepthEstimation
+import torch
 
 files = glob.glob("output/*.png")
 for f in files:
     os.remove(f)
 
 from sort import *
+
+feature_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-large")
+model = DPTForDepthEstimation.from_pretrained("Intel/dpt-large")
 
 tracker = Sort()
 memory = {}
@@ -83,8 +88,8 @@ configPath = os.path.sep.join([args["yolo"], "yolov3.cfg"])
 print("[INFO] loading YOLO from disk...")
 net = cv2.dnn.readNetFromDarknet(configPath, weightsPath)
 ln = net.getLayerNames()
-ln = [ln[i[0] - 1] for i in net.getUnconnectedOutLayers()]
-# ln = [ln[i - 1] for i in net.getUnconnectedOutLayers()]
+# ln = [ln[i[0] - 1] for i in net.getUnconnectedOutLayers()]
+ln = [ln[i - 1] for i in net.getUnconnectedOutLayers()]
 
 # initialize the video stream, pointer to output video file, and
 # frame dimensions
@@ -109,15 +114,37 @@ except:
     total = -1
 
 # loop over frames from the video file stream
+(grabbed, prev) = vs.read()
+prev = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+k = 0
 while True:
     # read the next frame from the file
     (grabbed, frame) = vs.read()
+    if not grabbed:
+        break
+    cur = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    flow = cv2.calcOpticalFlowFarneback(prev, cur, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    u, v = flow[..., 0], flow[..., 1]
+    pixel_speed = np.sqrt(u ** 2 + v ** 2)
+    prev = cur
+    #out = np.ones(frame.shape[:-1])
+
+    if k % 12 == 0:
+      pixel_values = feature_extractor(frame, return_tensors="pt").pixel_values
+      with torch.no_grad():
+        outputs = model(pixel_values)
+        predicted_depth = outputs.predicted_depth
+      prediction = torch.nn.functional.interpolate(
+                    predicted_depth.unsqueeze(1),
+                    size=frame.shape[:-1],
+                    mode="bicubic",
+                    align_corners=False,
+              ).squeeze()
+      out = prediction.cpu().numpy()
+    k+=1
 
     # if the frame was not grabbed, then we have reached the end
     # of the stream
-    if not grabbed:
-        break
-
     # if the frame dimensions are empty, grab them
     if W is None or H is None:
         (H, W) = frame.shape[:2]
@@ -175,9 +202,6 @@ while True:
     # apply non-maxima suppression to suppress weak, overlapping
     # bounding boxes
     idxs = cv2.dnn.NMSBoxes(boxes, confidences, args["confidence"], args["threshold"])
-    # print("idxs", idxs)
-    # print("boxes", boxes[i][0])
-    # print("boxes", boxes[i][1])
 
     dets = []
     if len(idxs) > 0:
@@ -219,78 +243,28 @@ while True:
 
             color = [int(c) for c in COLORS[indexIDs[i] % len(COLORS)]]
             cv2.rectangle(frame, (x, y), (w, h), color, 2)
+            tmp = pixel_speed[y:h, x:w]
+            tmp_denom = out[y:h, x:w]
+            pix_speed_box = np.mean(tmp) / np.mean(tmp_denom)**2
+            speed = np.round(1000 * pix_speed_box, 1)
+            text_speed = "{} km/h".format(abs(speed))
+            # text_speed = str(y) + " " + str(h)
+            cv2.putText(
+                frame,
+                text_speed,
+                (x, y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                color,
+                2,
+            )
 
-            if indexIDs[i] in previous:
-                previous_box = previous[indexIDs[i]]
-                (x2, y2) = (int(previous_box[0]), int(previous_box[1]))
-                (w2, h2) = (int(previous_box[2]), int(previous_box[3]))
-                p0 = (int(x + (w - x) / 2), int(y + (h - y) / 2))
-                p1 = (int(x2 + (w2 - x2) / 2), int(y2 + (h2 - y2) / 2))
-                cv2.line(frame, p0, p1, color, 3)
-
-                # Speed Calculation
-                y_pix_dist = int(y + (h - y) / 2) - int(y2 + (h2 - y2) / 2)
-                text_y = "{} y".format(y_pix_dist)
-                x_pix_dist = int(x + (w - x) / 2) - int(x2 + (w2 - x2) / 2)
-                text_x = "{} x".format(x_pix_dist)
-                # cv2.putText(
-                #     frame, text_y, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 4
-                # )
-                # cv2.putText(
-                #     frame, text_x, (x, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 4
-                # )
-                final_pix_dist = math.sqrt(
-                    (y_pix_dist * y_pix_dist) + (x_pix_dist * x_pix_dist)
-                )
-                speed = np.round(8 * y_pix_dist, 2)
-                text_speed = "{} km/h".format(abs(speed))
-                cv2.putText(
-                    frame,
-                    text_speed,
-                    (x, y - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    color,
-                    2,
-                )
-
-                if intersect(p0, p1, line1[0], line1[1]):
-                    counter1 += 1
-                if intersect(p0, p1, line2[0], line2[1]):
-                    counter2 += 1
-
-            # text = "{}: {:.4f}".format(LABELS[classIDs[i]], confidences[i])
-            # text = "{}".format(indexIDs[i])
+            text = "{}: {:.4f}".format(LABELS[classIDs[i]], confidences[i])
+            text = "{}".format(indexIDs[i])
             # cv2.putText(
             #     frame, text, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
             # )
             i += 1
-
-    # draw line
-    cv2.line(frame, line1[0], line1[1], (0, 255, 255), 4)
-    cv2.line(frame, line2[0], line2[1], (255, 0, 255), 2)
-
-    # draw counter
-    counter_text = "{}".format(counter1)
-    counter2_text = "{}".format(counter2)
-
-    cv2.putText(
-        frame, counter_text, (100, 250), cv2.FONT_HERSHEY_DUPLEX, 4.0, (0, 255, 255), 5
-    )
-    cv2.putText(
-        frame,
-        # "ctr2",
-        counter2_text,
-        (100, 400),
-        cv2.FONT_HERSHEY_DUPLEX,
-        4.0,
-        (255, 0, 255),
-        5,
-    )
-    # counter += 1
-
-    # saves image file
-    # +cv2.imwrite("output/frame-{}.png".format(frameIndex), frame)
 
     # check if the video writer is None
     if writer is None:
@@ -307,16 +281,11 @@ while True:
             print("[INFO] estimated total time to finish: {:.4f}".format(elap * total))
 
     # write the output frame to disk
-    writer.write(frame)
+    writer.write(frame) #frame
 
     # increase frame index
     frameIndex += 1
 
-    # if frameIndex >= 4000: # limits the execution to the first 4000 frames
-    #    print("[INFO] cleaning up...")
-    #    writer.release()
-    #    vs.release()
-    #    exit()
 
 # release the file pointers
 print("[INFO] cleaning up...")
